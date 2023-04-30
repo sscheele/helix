@@ -151,6 +151,7 @@ fn translate_positions(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(unreachable_code)]
 pub fn render_text<'t>(
     renderer: &mut TextRenderer,
     text: RopeSlice<'t>,
@@ -164,7 +165,8 @@ pub fn render_text<'t>(
 ) {
     let (
         Position {
-            row: mut row_off, ..
+            row: mut row_off,
+            col: mut col_off,
         },
         mut char_pos,
     ) = visual_offset_from_block(
@@ -175,6 +177,7 @@ pub fn render_text<'t>(
         text_annotations,
     );
     row_off += offset.vertical_offset;
+    col_off += offset.horizontal_offset;
 
     let (mut formatter, mut first_visible_char_idx) =
         DocumentFormatter::new_at_prev_checkpoint(text, text_fmt, text_annotations, offset.anchor);
@@ -197,104 +200,174 @@ pub fn render_text<'t>(
         .next()
         .unwrap_or_else(|| (Style::default(), usize::MAX));
 
-    loop {
+    'lines: loop {
         // formattter.line_pos returns to line index of the next grapheme
         // so it must be called before formatter.next
         let doc_line = formatter.line_pos();
-        let Some((grapheme, mut pos)) = formatter.next() else {
-            let mut last_pos = formatter.visual_pos();
-            if last_pos.row >= row_off {
-                last_pos.col -= 1;
-                last_pos.row -= row_off;
-                // check if any positions translated on the fly (like cursor) are at the EOF
-                translate_positions(
-                    char_pos + 1,
-                    first_visible_char_idx,
-                    translated_positions,
-                    text_fmt,
-                    renderer,
-                    last_pos,
-                );
-            }
-            break;
-        };
 
-        // skip any graphemes on visual lines before the block start
-        if pos.row < row_off {
-            if char_pos >= style_span.1 {
-                style_span = if let Some(style_span) = styles.next() {
-                    style_span
-                } else {
-                    break;
+        let curr_vis_row = formatter.visual_pos().row;
+        while formatter.visual_pos().col < col_off {
+            let Some((grapheme, _)) = formatter.next() else {
+                let mut last_pos = formatter.visual_pos();
+                if last_pos.row >= row_off {
+                    last_pos.col -= 1;
+                    last_pos.row -= row_off;
+                    // check if any positions translated on the fly (like cursor) are at the EOF
+                    translate_positions(
+                        char_pos + 1,
+                        first_visible_char_idx,
+                        translated_positions,
+                        text_fmt,
+                        renderer,
+                        last_pos,
+                    );
                 }
+                break;
+            };
+            char_pos += grapheme.doc_chars();
+        }
+        while char_pos >= style_span.1 {
+            style_span = if let Some(style_span) = styles.next() {
+                style_span
+            } else {
+                break;
+            }
+        }
+
+        'line_chars: loop {
+            let Some((grapheme, mut pos)) = formatter.next() else {
+                let mut last_pos = formatter.visual_pos();
+                if last_pos.row >= row_off {
+                    last_pos.col -= 1;
+                    last_pos.row -= row_off;
+                    // check if any positions translated on the fly (like cursor) are at the EOF
+                    translate_positions(
+                        char_pos + 1,
+                        first_visible_char_idx,
+                        translated_positions,
+                        text_fmt,
+                        renderer,
+                        last_pos,
+                    );
+                }
+                break 'lines;
+            };
+
+            // skip any graphemes on visual lines before the block start
+            if pos.row < row_off {
+                if char_pos >= style_span.1 {
+                    style_span = if let Some(style_span) = styles.next() {
+                        style_span
+                    } else {
+                        break 'lines;
+                    }
+                }
+                char_pos += grapheme.doc_chars();
+                first_visible_char_idx = char_pos + 1;
+                continue;
+            }
+            pos.row -= row_off;
+
+            // if (pos.col - col_off) as u16 > renderer.viewport.width {
+            //     break 'line_chars;
+            // }
+
+            // if the end of the viewport is reached stop rendering
+            if pos.row as u16 >= renderer.viewport.height {
+                break 'lines;
+            }
+
+            // apply decorations before rendering a new line
+            if pos.row as u16 != last_line_pos.visual_line {
+                if pos.row > 0 {
+                    renderer.draw_indent_guides(last_line_indent_level, last_line_pos.visual_line);
+                    is_in_indent_area = true;
+                    for line_decoration in &mut *line_decorations {
+                        line_decoration.render_foreground(renderer, last_line_pos, char_pos);
+                    }
+                }
+                last_line_pos = LinePos {
+                    first_visual_line: doc_line != last_line_pos.doc_line,
+                    doc_line,
+                    visual_line: pos.row as u16,
+                    start_char_idx: char_pos,
+                };
+                for line_decoration in &mut *line_decorations {
+                    line_decoration.render_background(renderer, last_line_pos);
+                }
+            }
+
+            // acquire the correct grapheme style
+            if char_pos >= style_span.1 {
+                style_span = styles.next().unwrap_or((Style::default(), usize::MAX));
             }
             char_pos += grapheme.doc_chars();
-            first_visible_char_idx = char_pos + 1;
-            continue;
-        }
-        pos.row -= row_off;
 
-        // if the end of the viewport is reached stop rendering
-        if pos.row as u16 >= renderer.viewport.height {
-            break;
-        }
+            // check if any positions translated on the fly (like cursor) has been reached
+            translate_positions(
+                char_pos,
+                first_visible_char_idx,
+                translated_positions,
+                text_fmt,
+                renderer,
+                pos,
+            );
 
-        // apply decorations before rendering a new line
-        if pos.row as u16 != last_line_pos.visual_line {
-            if pos.row > 0 {
-                renderer.draw_indent_guides(last_line_indent_level, last_line_pos.visual_line);
-                is_in_indent_area = true;
-                for line_decoration in &mut *line_decorations {
-                    line_decoration.render_foreground(renderer, last_line_pos, char_pos);
+            let grapheme_style = if let GraphemeSource::VirtualText { highlight } = grapheme.source
+            {
+                let style = renderer.text_style;
+                if let Some(highlight) = highlight {
+                    style.patch(theme.highlight(highlight.0))
+                } else {
+                    style
                 }
-            }
-            last_line_pos = LinePos {
-                first_visual_line: doc_line != last_line_pos.doc_line,
-                doc_line,
-                visual_line: pos.row as u16,
-                start_char_idx: char_pos,
-            };
-            for line_decoration in &mut *line_decorations {
-                line_decoration.render_background(renderer, last_line_pos);
-            }
-        }
-
-        // acquire the correct grapheme style
-        if char_pos >= style_span.1 {
-            style_span = styles.next().unwrap_or((Style::default(), usize::MAX));
-        }
-        char_pos += grapheme.doc_chars();
-
-        // check if any positions translated on the fly (like cursor) has been reached
-        translate_positions(
-            char_pos,
-            first_visible_char_idx,
-            translated_positions,
-            text_fmt,
-            renderer,
-            pos,
-        );
-
-        let grapheme_style = if let GraphemeSource::VirtualText { highlight } = grapheme.source {
-            let style = renderer.text_style;
-            if let Some(highlight) = highlight {
-                style.patch(theme.highlight(highlight.0))
             } else {
-                style
-            }
-        } else {
-            style_span.0
-        };
+                style_span.0
+            };
 
-        let virt = grapheme.is_virtual();
-        renderer.draw_grapheme(
-            grapheme.grapheme,
-            grapheme_style,
-            virt,
-            &mut last_line_indent_level,
-            &mut is_in_indent_area,
-            pos,
-        );
+            let virt = grapheme.is_virtual();
+            renderer.draw_grapheme(
+                grapheme.grapheme,
+                grapheme_style,
+                virt,
+                &mut last_line_indent_level,
+                &mut is_in_indent_area,
+                pos,
+            );
+
+            if pos.row + row_off != formatter.visual_pos().row {
+                // begin next line
+                continue 'lines;
+            }
+        }
+        // consume all remaining characters in line to get cursor to correct position
+        while formatter.visual_pos().row == curr_vis_row {
+            let Some((grapheme, _)) = formatter.next() else {
+                let mut last_pos = formatter.visual_pos();
+                if last_pos.row >= row_off {
+                    last_pos.col -= 1;
+                    last_pos.row -= row_off;
+                    // check if any positions translated on the fly (like cursor) are at the EOF
+                    translate_positions(
+                        char_pos + 1,
+                        first_visible_char_idx,
+                        translated_positions,
+                        text_fmt,
+                        renderer,
+                        last_pos,
+                    );
+                }
+                break;
+            };
+            char_pos += grapheme.doc_chars();
+        }
+        while char_pos >= style_span.1 {
+            style_span = if let Some(style_span) = styles.next() {
+                style_span
+            } else {
+                break;
+            }
+        }
     }
 
     renderer.draw_indent_guides(last_line_indent_level, last_line_pos.visual_line);
